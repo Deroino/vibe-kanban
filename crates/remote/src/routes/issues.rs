@@ -1,6 +1,6 @@
 use api_types::{
     CreateIssueRequest, DeleteResponse, Issue, ListIssuesQuery, ListIssuesResponse,
-    MutationResponse, UpdateIssueRequest,
+    MutationResponse, NotificationType, UpdateIssueRequest,
 };
 use axum::{
     Json,
@@ -21,6 +21,9 @@ use crate::{
     auth::RequestContext,
     db::{get_txid, issues::IssueRepository},
     mutation_definition::MutationBuilder,
+    services::notifications::{
+        collect_issue_recipients, notify_issue_subscribers, send_issue_notifications,
+    },
 };
 
 /// Mutation definition for Issue - provides both router and TypeScript metadata.
@@ -176,7 +179,13 @@ async fn update_issue(
         })?
         .ok_or_else(|| ErrorResponse::new(StatusCode::NOT_FOUND, "issue not found"))?;
 
-    ensure_project_access(state.pool(), ctx.user.id, issue.project_id).await?;
+    let organization_id =
+        ensure_project_access(state.pool(), ctx.user.id, issue.project_id).await?;
+
+    let status_changed = payload
+        .status_id
+        .is_some_and(|new| new != issue.status_id);
+    let old_status_id = issue.status_id;
 
     let mut tx = state.pool().begin().await.map_err(|error| {
         tracing::error!(?error, "failed to begin transaction");
@@ -214,6 +223,22 @@ async fn update_issue(
         ErrorResponse::new(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
     })?;
 
+    if status_changed {
+        notify_issue_subscribers(
+            state.pool(),
+            organization_id,
+            ctx.user.id,
+            &data,
+            NotificationType::IssueStatusChanged,
+            serde_json::json!({
+                "old_status_id": old_status_id.to_string(),
+                "new_status_id": data.status_id.to_string(),
+            }),
+            None,
+        )
+        .await;
+    }
+
     Ok(Json(MutationResponse { data, txid }))
 }
 
@@ -235,7 +260,13 @@ async fn delete_issue(
         })?
         .ok_or_else(|| ErrorResponse::new(StatusCode::NOT_FOUND, "issue not found"))?;
 
-    ensure_project_access(state.pool(), ctx.user.id, issue.project_id).await?;
+    let organization_id =
+        ensure_project_access(state.pool(), ctx.user.id, issue.project_id).await?;
+
+    let recipients =
+        collect_issue_recipients(state.pool(), organization_id, issue.id, ctx.user.id)
+            .await
+            .unwrap_or_default();
 
     let response = IssueRepository::delete(state.pool(), issue_id)
         .await
@@ -243,6 +274,18 @@ async fn delete_issue(
             tracing::error!(?error, "failed to delete issue");
             ErrorResponse::new(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
         })?;
+
+    send_issue_notifications(
+        state.pool(),
+        organization_id,
+        ctx.user.id,
+        &recipients,
+        &issue,
+        NotificationType::IssueDeleted,
+        serde_json::json!({}),
+        None,
+    )
+    .await;
 
     Ok(Json(response))
 }
